@@ -1,6 +1,9 @@
 .env
+.env.*
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+audit_log.jsonl
+*.jsonl
