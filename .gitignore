@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 audit_log.jsonl
 *.jsonl
+script.md

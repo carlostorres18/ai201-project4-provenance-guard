@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import uuid
 from typing import Any
 from datetime import datetime, timezone
@@ -10,12 +9,13 @@ from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+from audit import append_audit_log, find_first_event, get_audit_log_entries, update_first_event
+from labels import generate_transparency_label
 from signals import (
-    compute_confidence,
     classify_confidence,
+    compute_confidence,
     heuristic_perplexity_signal,
     groq_style_assessment,
-    label_for_classification,
 )
 
 
@@ -85,42 +85,6 @@ def compute_linguistic_style_score(text: str) -> float:
     return clamp01(score)
 
 
-def append_audit_log(entry: dict[str, Any]) -> None:
-    log_path = os.getenv("AUDIT_LOG_PATH", "audit_log.jsonl")
-    parent_dir = os.path.dirname(log_path)
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-
-    with open(log_path, "a", encoding="utf-8") as handle:
-        handle.write(f"{json.dumps(entry, ensure_ascii=False)}\n")
-
-
-def get_audit_log_entries(limit: int = 50) -> list[dict[str, Any]]:
-    log_path = os.getenv("AUDIT_LOG_PATH", "audit_log.jsonl")
-    if limit <= 0:
-        return []
-
-    try:
-        with open(log_path, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except FileNotFoundError:
-        return []
-
-    entries: list[dict[str, Any]] = []
-    for line in reversed(lines[-limit:]):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            entries.append(payload)
-
-    return entries
-
-
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -135,7 +99,8 @@ def create_app() -> Flask:
     limiter = Limiter(
         get_remote_address,
         app=app,
-        default_limits=[os.getenv("RATE_LIMIT", "10 per minute")],
+        default_limits=[],
+        storage_uri="memory://",
     )
 
     @app.get("/log")
@@ -150,7 +115,7 @@ def create_app() -> Flask:
         return jsonify({"entries": get_audit_log_entries(limit=limit)}), 200
 
     @app.post("/submit")
-    @limiter.limit(os.getenv("SUBMIT_RATE_LIMIT", "5 per minute"))
+    @limiter.limit(os.getenv("SUBMIT_RATE_LIMIT", "10 per minute;100 per day"))
     def submit() -> tuple[Any, int]:
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
@@ -168,8 +133,12 @@ def create_app() -> Flask:
         timestamp = utc_timestamp()
 
         try:
-            signal_1 = groq_style_assessment(text)
-            signal_2 = heuristic_perplexity_signal(text)
+            if os.getenv("MOCK_SIGNALS", "0") == "1":
+                signal_1 = {"style_score": 0.5, "reasoning": "mock"}
+                signal_2 = {"perplexity_score": 0.5, "reasoning": "mock"}
+            else:
+                signal_1 = groq_style_assessment(text)
+                signal_2 = heuristic_perplexity_signal(text)
         except Exception as exc:
             append_audit_log(
                 {
@@ -196,7 +165,7 @@ def create_app() -> Flask:
 
         confidence = compute_confidence(style_score=style_score, perplexity_score=perplexity_score)
         attribution = classify_confidence(confidence)
-        label = label_for_classification(attribution)
+        transparency_label = generate_transparency_label(confidence)
 
         response = {
             "content_id": content_id,
@@ -205,17 +174,18 @@ def create_app() -> Flask:
             "signal_2": signal_2,
             "attribution": attribution,
             "confidence": confidence,
-            "label": label,
+            "label": {"title": transparency_label.title, "message": transparency_label.message},
         }
 
         append_audit_log(
             {
                 "timestamp": timestamp,
+                "event": "submit",
                 "content_id": content_id,
                 "creator_id": creator_id,
                 "attribution": attribution,
                 "confidence": confidence,
-                "label": label,
+                "label": {"title": transparency_label.title, "message": transparency_label.message},
                 "style_score": style_score,
                 "perplexity_score": perplexity_score,
                 "status": "classified",
@@ -223,6 +193,59 @@ def create_app() -> Flask:
         )
 
         return jsonify(response), 200
+
+    @app.post("/appeal")
+    @limiter.limit(os.getenv("APPEAL_RATE_LIMIT", "10 per hour"))
+    def appeal() -> tuple[Any, int]:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        content_id = payload.get("content_id")
+        if not isinstance(content_id, str) or not content_id.strip():
+            return jsonify({"error": "Field 'content_id' is required"}), 400
+
+        creator_reasoning = payload.get("creator_reasoning")
+        if not isinstance(creator_reasoning, str) or not creator_reasoning.strip():
+            return jsonify({"error": "Field 'creator_reasoning' is required"}), 400
+
+        timestamp = utc_timestamp()
+        submission = find_first_event(content_id=content_id, event="submit")
+        if submission is None:
+            return jsonify({"error": "content_id not found"}), 404
+
+        updated = update_first_event(content_id=content_id, event="submit", updates={"status": "under_review"})
+        if not updated:
+            return jsonify({"error": "failed to update status"}), 500
+
+        appeal_id = str(uuid.uuid4())
+        append_audit_log(
+            {
+                "timestamp": timestamp,
+                "event": "appeal",
+                "appeal_id": appeal_id,
+                "content_id": content_id,
+                "creator_id": submission.get("creator_id"),
+                "creator_reasoning": creator_reasoning,
+                "original_attribution": submission.get("attribution"),
+                "original_confidence": submission.get("confidence"),
+                "original_style_score": submission.get("style_score"),
+                "original_perplexity_score": submission.get("perplexity_score"),
+                "status": "under_review",
+            }
+        )
+
+        return (
+            jsonify(
+                {
+                    "content_id": content_id,
+                    "appeal_id": appeal_id,
+                    "status": "under_review",
+                    "message": "appeal received",
+                }
+            ),
+            200,
+        )
 
     return app
 
