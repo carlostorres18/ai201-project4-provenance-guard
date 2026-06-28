@@ -10,7 +10,13 @@ from flask import Flask, jsonify, request
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-from signals import groq_style_assessment
+from signals import (
+    compute_confidence,
+    classify_confidence,
+    heuristic_perplexity_signal,
+    groq_style_assessment,
+    label_for_classification,
+)
 
 
 def clamp01(value: float) -> float:
@@ -115,14 +121,6 @@ def get_audit_log_entries(limit: int = 50) -> list[dict[str, Any]]:
     return entries
 
 
-def classify_from_signal_1(style_score: float) -> str:
-    if style_score <= 0.39:
-        return "likely_human"
-    if style_score >= 0.61:
-        return "likely_ai"
-    return "uncertain"
-
-
 def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -171,6 +169,7 @@ def create_app() -> Flask:
 
         try:
             signal_1 = groq_style_assessment(text)
+            signal_2 = heuristic_perplexity_signal(text)
         except Exception as exc:
             append_audit_log(
                 {
@@ -185,7 +184,7 @@ def create_app() -> Flask:
                 jsonify(
                     {
                         "content_id": content_id,
-                        "error": "signal_1_failed",
+                        "error": "signal_failed",
                         "message": str(exc),
                     }
                 ),
@@ -193,15 +192,17 @@ def create_app() -> Flask:
             )
 
         style_score = float(signal_1["style_score"])
+        perplexity_score = float(signal_2["perplexity_score"])
 
-        attribution = classify_from_signal_1(style_score)
-        confidence = 0.5
-        label = "Attribution Uncertain"
+        confidence = compute_confidence(style_score=style_score, perplexity_score=perplexity_score)
+        attribution = classify_confidence(confidence)
+        label = label_for_classification(attribution)
 
         response = {
             "content_id": content_id,
             "creator_id": creator_id,
             "signal_1": signal_1,
+            "signal_2": signal_2,
             "attribution": attribution,
             "confidence": confidence,
             "label": label,
@@ -215,7 +216,8 @@ def create_app() -> Flask:
                 "attribution": attribution,
                 "confidence": confidence,
                 "label": label,
-                "llm_score": style_score,
+                "style_score": style_score,
+                "perplexity_score": perplexity_score,
                 "status": "classified",
             }
         )
